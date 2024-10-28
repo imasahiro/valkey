@@ -473,6 +473,65 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     if (len > reply_len) _addReplyProtoToList(c, c->reply, s + reply_len, len - reply_len);
 }
 
+struct reply_buffer {
+    char *buf;
+    void *private_data;
+    void (*callback)(client *c, void *private_data, size_t len);
+};
+
+static void static_buffer_callback(client *c, void *private_data, size_t reply_len) {
+    UNUSED(private_data);
+    c->net_output_bytes_curr_cmd += reply_len;
+    c->bufpos += reply_len;
+    /* We update the buffer peak after appending the reply to the buffer */
+    if (c->buf_peak < (size_t)c->bufpos) {
+        c->buf_peak = (size_t)c->bufpos;
+    }
+}
+
+static void reply_linked_list_callback(client *c, void *private_data, size_t reply_len) {
+    clientReplyBlock *tail = (clientReplyBlock *)private_data;
+    c->net_output_bytes_curr_cmd += reply_len;
+    tail->used += reply_len;
+}
+
+/* Attempts to ensure that a reply buffer (the static buffer in the client struct or the reply linked
+ * list) has a sufficient buffer.
+ * Returns NULL if it does not have sufficient contiguous memory area at a reply buffer. */
+static struct reply_buffer *_reserveContinuousReplyBuffer(client *c, size_t len, struct reply_buffer *rbuf) {
+    return NULL;
+    if (c->flag.close_after_reply) {
+        return NULL;
+    }
+    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
+        return NULL;
+    }
+
+    if (listLength(c->reply) > 0 ||
+        (c->flag.pushing && c == server.current_client && server.executing_client &&
+         !cmdHasPushAsReply(server.executing_client->cmd))) {
+        listNode *ln = listLast(c->reply);
+        clientReplyBlock *tail = ln ? listNodeValue(ln) : NULL;
+        if (tail == NULL) {
+            return NULL;
+        }
+        if (tail->size - tail->used < len) {
+            return NULL;
+        }
+        rbuf->buf = tail->buf + tail->used;
+        rbuf->private_data = (void *)tail;
+        rbuf->callback = reply_linked_list_callback;
+        return rbuf;
+    }
+    if (c->buf_usable_size - c->bufpos < len) {
+        return NULL;
+    }
+    rbuf->buf = c->buf + c->bufpos;
+    rbuf->private_data = NULL;
+    rbuf->callback = static_buffer_callback;
+    return rbuf;
+}
+
 /* -----------------------------------------------------------------------------
  * Higher level functions to queue data on the client output buffer.
  * The following functions are the ones that commands implementations will call.
@@ -489,8 +548,16 @@ void addReply(client *c, robj *obj) {
          * using our optimized function, and attach the resulting string
          * to the output buffer. */
         char buf[32];
-        size_t len = ll2string(buf, sizeof(buf), (long)obj->ptr);
-        _addReplyToBufferOrList(c, buf, len);
+        struct reply_buffer rbuf, *rbuf_p;
+        rbuf_p = _reserveContinuousReplyBuffer(c, sizeof(buf), &rbuf);
+
+        if (rbuf_p == NULL) {
+            size_t len = ll2string(buf, sizeof(buf), (long)obj->ptr);
+            _addReplyToBufferOrList(c, buf, len);
+            return;
+        }
+        size_t len = ll2string(rbuf.buf, sizeof(buf), (long)obj->ptr);
+        rbuf.callback(c, rbuf.private_data, len);
     } else {
         serverPanic("Wrong obj->encoding in addReply()");
     }
@@ -996,9 +1063,6 @@ void addReplyHumanLongDouble(client *c, long double d) {
 /* Add a long long as integer reply or bulk len / multi bulk count.
  * Basically this is used to output <prefix><long long><crlf>. */
 static void _addReplyLongLongWithPrefix(client *c, long long ll, char prefix) {
-    char buf[128];
-    int len;
-
     /* Things like $3\r\n or *2\r\n are emitted very often by the protocol
      * so we have a few shared objects to use if the integer is small
      * like it is most of the times. */
@@ -1018,11 +1082,21 @@ static void _addReplyLongLongWithPrefix(client *c, long long ll, char prefix) {
         return;
     }
 
-    buf[0] = prefix;
-    len = ll2string(buf + 1, sizeof(buf) - 1, ll);
-    buf[len + 1] = '\r';
-    buf[len + 2] = '\n';
-    _addReplyToBufferOrList(c, buf, len + 3);
+    char buf[128];
+    struct reply_buffer rbuf, *rbuf_p;
+    rbuf_p = _reserveContinuousReplyBuffer(c, sizeof(buf), &rbuf);
+    if (rbuf_p == NULL) {
+        rbuf.buf = buf;
+    }
+    rbuf.buf[0] = prefix;
+    int len = ll2string(rbuf.buf + 1, sizeof(buf), ll);
+    rbuf.buf[len + 1] = '\r';
+    rbuf.buf[len + 2] = '\n';
+    if (rbuf.buf == buf) {
+        _addReplyToBufferOrList(c, buf, len + 3);
+    } else {
+        rbuf.callback(c, rbuf.private_data, len + 3);
+    }
 }
 
 void addReplyLongLong(client *c, long long ll) {
@@ -1177,19 +1251,30 @@ void addReplyBulkCString(client *c, const char *s) {
 
 /* Add a long long as a bulk reply */
 void addReplyBulkLongLong(client *c, long long ll) {
-    char buf[64];
-    int len;
-
-    len = ll2string(buf, 64, ll);
-    addReplyBulkCBuffer(c, buf, len);
+    writePreparedClient *wpc = prepareClientForFutureWrites(c);
+    if (!wpc) {
+        return;
+    }
+    addWritePreparedReplyBulkLongLong(wpc, ll);
 }
 
 void addWritePreparedReplyBulkLongLong(writePreparedClient *wpc, long long ll) {
     char buf[64];
-    int len;
-
-    len = ll2string(buf, 64, ll);
-    addWritePreparedReplyBulkCBuffer(wpc, buf, len);
+    struct reply_buffer rbuf, *rbuf_p;
+    client *c = (client *)wpc;
+    int digits = sdigits10(ll);
+    _addReplyLongLongWithPrefix(c, digits, '$');
+    rbuf_p = _reserveContinuousReplyBuffer(c, sizeof(buf), &rbuf);
+    if (rbuf_p == NULL) {
+        int len = ll2string(buf, sizeof(buf), ll);
+        _addReplyToBufferOrList(c, buf, len);
+        _addReplyToBufferOrList(c, "\r\n", 2);
+        return;
+    }
+    int len = ll2string(rbuf_p->buf, sizeof(buf), ll);
+    rbuf_p->buf[len + 1] = '\r';
+    rbuf_p->buf[len + 2] = '\n';
+    rbuf_p->callback(c, rbuf_p->private_data, len + 2);
 }
 
 /* Reply with a verbatim type having the specified extension.
